@@ -45,11 +45,11 @@ static class Server
 	// ------------------------------------------------------------------------------------
 	public static async Task Start()
 	{
-		ms_mem_blk_pool_Html = new(EN_bytes_Html_Recv_Buf, "Html_Recv_Buf");
+		ms_mem_blk_pool_Html = new MemBlk_Pool(EN_bytes_Html_Recv_Buf, "Html_Recv_Buf");
 		HtmlContext.Set_mem_blk_pool(ms_mem_blk_pool_Html);
 
 		// WS ペイロードのマスクを外す処理を簡易化するために、「+3」としている。
-		ms_mem_blk_pool_WS = new(Common.EN_bytes_WS_Buf + 3, "WS_Recv_Buf");
+		ms_mem_blk_pool_WS = new MemBlk_Pool(Common.EN_bytes_WS_Buf + 3, "WS_Recv_Buf");
 		WsContext.Set_mem_blk_pool(ms_mem_blk_pool_WS);
 
 		// Server.Close() により停止させるとき、ソケットをクローズさせるためにメンバ変数として記録している
@@ -57,7 +57,7 @@ static class Server
 		uint idx_html_context = 0;
 
 		using (ms_semph_List_HtmlContextInfo = new SemaphoreSlim(1))
-		using (ms_semph_List_WsContext = new (1))
+		using (ms_semph_List_WsContext = new SemaphoreSlim(1))
 		try
 		{
 			ms_TcpListener_html.Start();
