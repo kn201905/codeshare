@@ -1,0 +1,28 @@
+html, body {
+	margin-left: 2rem;
+	margin-right: 2rem;
+}
+
+#editor {
+	z-index: 0;
+	position: absolute;
+	top: 0;
+	right: 0;
+	bottom: 0;
+	left: 0;
+	font-size: 0.9rem;
+	line-height: 1.2rem;
+}
+
+.Ctrl_pnl {
+	z-index: 10;
+	position: absolute;
+	top: 0;
+	right: 0;
+}
+
+.Info_divTxt {
+	background-color: rgba(255, 255, 255, 0.5);
+	padding: 0 0.5rem;
+	margin-right: 1rem;
+}
