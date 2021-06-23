@@ -2,143 +2,127 @@ using System;
 using System.Threading;
 using System.Net.Sockets;
 using System.Threading.Tasks;
-using System.Text;
-using WS_ID = WS_Recv_Buf.WS_ID;
 
 #pragma warning disable CA1835  // CA1835: ReadAsync(), WriteAsync() を、ReadOnlyMemory<> 呼び出しに変更する
 
 /////////////////////////////////////////////////////////////////////////////////////////
 
-class WsContext
+partial class WsContext
 {
-	static MemBlk_Pool ms_mem_blk_pool_WS = null;
-	public static void Set_mem_blk_pool(MemBlk_Pool mem_blk_pool) => ms_mem_blk_pool_WS = mem_blk_pool;
+	const int EN_msec_WS_WriteTimeout = 5000;  // WS の Write に関しては、５秒をタイムアウトの設定しにしている
 
-	// ハートビート送信用バッファ（ハートビート受信バッファは、通常受信バッファが利用される）
-	static readonly byte[] ms_heart_beat_send_buf = new byte[2] { 0x89, 0x00 };
+	static MemBlk_Pool ms_mem_blk_pool_for_WS_Buf = null;
+	public static void Set_mem_blk_pool_for_WS_Buf(MemBlk_Pool mem_blk_pool) => ms_mem_blk_pool_for_WS_Buf = mem_blk_pool;
 
 	// ---------------------------------------------
-	WS_Recv_Buf m_ws_Recv_buf;
-	WS_Send_Buf m_ws_Send_buf;
+	Ws_RecvBuf m_ws_Recv_buf = null;
+	Ws_Sender m_ws_Sender = null;
 
-	readonly uint m_idx_ws_context;		// コンストラクタで設定
+	readonly ushort m_idx_ws_context;
 
 	// ws データ受信用と、ハートビート受信用の複数箇所で利用するために、メンバ変数としている
 	NetworkStream m_ns_ws = null;
 
-	// // ハートビート書きこみのためのセマフォ（m_ns_ws の読み込み待機は、１ヶ所だけでしかできない）
-	SemaphoreSlim m_sem_for_ns_ws_write;
+	// ws コマンド進行のためのセマフォ
+	SemaphoreSlim m_semph_WS_Cmd;
+	public void Up_semph_WS_Cmd() => m_semph_WS_Cmd.Release();
+	bool mb_abort_ws_context = false;
 
-	bool mb_receive_heart_beat_on_ws_spawn_context_thread = false;
-	bool mb_failed_heart_beat = false;
+	// 以下は、「unused」でなく「unget」
+	uint m_cs_pos_unget = 0;
+	ushort m_cs_idx_unget = 0;
 
 	CancellationTokenSource m_cts_for_ReadAsync_ws_ns = null;
-	// ハートビート interval wait をキャンセルするためのもの
-	CancellationTokenSource m_cts_for_HeartBeat_intvl_wait = null;
+
+	// =================================================
+	// 以下は暫定的に存在するメンバ変数
+	bool mb_is_code_displayed_on_client = false;  // CMD_Req_Doc が可能かどうかに利用される
+	public bool bIs_Code_Displayed_on_client() => mb_is_code_displayed_on_client;
 
 	// ------------------------------------------------------------------------------------
-	public WsContext(uint idx_ws_context)
+	enum WS_ID
+	{
+//		EN_Pong,
+		EN_WS_Close,
+		EN_none,  // 通常処理を終えて、特に通知することがない場合
+		EN_Invalid,  // 不正な ws パケットを送ってきたため、相手を切断する
+	}
+
+	// ------------------------------------------------------------------------------------
+	public WsContext(ushort idx_ws_context)
 	{
 		m_idx_ws_context = idx_ws_context;
 	}
 
 	// ------------------------------------------------------------------------------------
 	// Abort_WS_Context() は、WS_Spawn_Context() の最初の await 以降にコールされることを想定している
-	// 上記の場合、m_cts_for_ReadAsync_ws_ns と m_cts_for_HeartBeat_intvl_wait は生成済みとなっている
+	// この関数がコールされるということは、m_cts_for_ReadAsync_ws_ns と m_semph_WS_Cmd は生成済みとなっている
 
 	public void Abort_WS_Context()
 	{
 		if (m_cts_for_ReadAsync_ws_ns.IsCancellationRequested == false) { m_cts_for_ReadAsync_ws_ns.Cancel(); }
-		if (m_cts_for_HeartBeat_intvl_wait.IsCancellationRequested == false) { m_cts_for_HeartBeat_intvl_wait.Cancel(); }
+
+		mb_abort_ws_context = true;
+		m_semph_WS_Cmd.Release();
 	}
 
 	// ------------------------------------------------------------------------------------
 	public async Task WS_Spawn_Context(NetworkStream ns_WS, string str_ws_accept_key)
 	{
-		ms_iLog.WrtLine($"--- html : {m_idx_ws_context} -> Upgrade to WebSocket");
+//		ms_iLog.WrtLine($"--- html : {m_idx_ws_context} === Upgrade to WebSocket ---");
 		m_ns_ws = ns_WS;
+		m_ns_ws.WriteTimeout = EN_msec_WS_WriteTimeout;
 
-		using (MemBlk mem_blk_WS = ms_mem_blk_pool_WS.Lease_MemBlk())
+		Task task_cmd_thread = null;
+		bool bDo_Add_WsContext = false;
+
+		using (MemBlk mem_blk_WS_Recv_Buf = ms_mem_blk_pool_for_WS_Buf.Lease_MemBlk())
+		using (MemBlk mem_blk_WS_Send_Stream_Buf = ms_mem_blk_pool_for_WS_Buf.Lease_MemBlk())
 		using (m_cts_for_ReadAsync_ws_ns = new CancellationTokenSource())
-		using (m_cts_for_HeartBeat_intvl_wait = new CancellationTokenSource())
-		using (m_sem_for_ns_ws_write = new SemaphoreSlim(1))
+		using (m_semph_WS_Cmd = new SemaphoreSlim(0))  // m_semph_WS_Cmd は停止状態からスタートする
 		try
 		{
-			// メモリバッファは、Recv と Send で兼用できる。（必ず交互にアクセスするため。ハートビート送信用は別枠にある）
-			byte[] ary_buf_ws = mem_blk_WS.Get_ary_buf();
-			m_ws_Recv_buf = new WS_Recv_Buf(ary_buf_ws);
-			m_ws_Send_buf = new WS_Send_Buf(ary_buf_ws);
+			byte[] ary_buf_Recv = mem_blk_WS_Recv_Buf.Get_ary_buf();
+			m_ws_Sender = new Ws_Sender(m_ns_ws, mem_blk_WS_Send_Stream_Buf.Get_ary_buf());
+			m_ws_Recv_buf = new Ws_RecvBuf(m_ns_ws, ary_buf_Recv, m_idx_ws_context, m_cts_for_ReadAsync_ws_ns);
 
 			// --------------------------------------------------------
 			// WebSocket のオープン処理
-			int bytes_accept_response = m_ws_Send_buf.Set_WS_Accept_Response(str_ws_accept_key);
-			await m_ns_ws.WriteAsync(ary_buf_ws, 0, bytes_accept_response);
+			await m_ws_Sender.Send_WS_Accept_Response(str_ws_accept_key);
 
-			// WebSocket をオープンしたため、ハートビートを起動する
-			Task task_heart_beat = Task.Run(this.WS_HeartBeat);
+			// WebSocket をオープンしたため、コマンドスレッドを起動し、コマンドストリームに登録する
+			// m_pos_unget, m_cs_idx_unget には、「CMD_Req_Doc」or「CMD_No_Doc」を書き込んだ位置の情報が返される
+			CmdStream.Add_WsContext(this, out m_cs_pos_unget, out m_cs_idx_unget);
+			bDo_Add_WsContext = true;
+
+			// m_pos_unget と m_cs_idx_unget の値をもらった後に、WS_Cmd_Thread を起動すること
+			task_cmd_thread = Task.Run(this.WS_Cmd_Thread);
 
 			// --------------------------------------------------------
 			// WebSocket による通信開始
 			for (;;)
 			{
-				if (Server.Is_in_ShuttingDown() || mb_failed_heart_beat) { break; }  // for (;;)
+				if (Server.Is_in_ShuttingDown() || mb_abort_ws_context) { break; }  // for (;;)
 
-				// ws の受信、または、ハートビートの受信
-				int bytes_recv = await m_ns_ws.ReadAsync(ary_buf_ws, 0, Common.EN_bytes_WS_Buf, m_cts_for_ReadAsync_ws_ns.Token);
-				ms_iLog.WrtLine($"--- ws 受信 : {m_idx_ws_context} -> {bytes_recv} bytes");
+				int bytes_recv = await m_ns_ws.ReadAsync(ary_buf_Recv, 0, Common.EN_bytes_WS_Buf
+																	, m_cts_for_ReadAsync_ws_ns.Token);
+//				ms_iLog.WrtLine($"--- ws : {m_idx_ws_context} -- 受信 {bytes_recv} bytes");
 
 				if (bytes_recv == 0) { break; }  // 相手側がクローズした場合
-				if (Server.Is_in_ShuttingDown() || mb_failed_heart_beat) { break; }  // for (;;)
+				if (Server.Is_in_ShuttingDown() || mb_abort_ws_context) { break; }  // for (;;)
 
-				// ハートビートの処理
-				if (ary_buf_ws[0] == 0x8a)
+				// リードバッファの pos 等の初期化
+				m_ws_Recv_buf.Set_bytes_recv(bytes_recv);
+
+				for (;;)
 				{
-					mb_receive_heart_beat_on_ws_spawn_context_thread = true;
-					ms_iLog.WrtLine($"--- ws : {m_idx_ws_context} -> Receive HeartBeat");
-
-					// ############################
-					if (bytes_recv > 6)
-					{ throw new Exception("!!! WS 受信パケットの連続処理は未実装。"); }
-
-					continue;  // for (;;)
+					// WSパケットを「１つ」処理する
+					if (await m_ws_Recv_buf.Read_Next() == false) { goto TERMINATE_WS_ReadAsync; }
+					if (m_ws_Recv_buf.Is_Complete_toRead() == true) { break; }
 				}
+			}
 
-				// クライアントからの ws のクローズ依頼処理（標準ではないはず）
-				if (ary_buf_ws[0] == 0x88)
-				{
-					ms_iLog.WrtLine($"--- ws : {m_idx_ws_context} -> クライアントから Close opcode を受信しました。");
-					break;  // for (;;)
-				}
-
-				m_ws_Recv_buf.Prepare_Read(bytes_recv);
-
-				for (;;)  // (A)
-				{
-					var (ws_id, b_complete) = m_ws_Recv_buf.Read();
-					switch (ws_id)
-					{
-					case WS_ID.EN_none: break;
-
-					case WS_ID.EN_Pong:
-						mb_receive_heart_beat_on_ws_spawn_context_thread = true;
-						ms_iLog.WrtLine($"--- ws : {m_idx_ws_context} -> Receive HeartBeat");
-						break;
-				
-					case WS_ID.EN_Close: goto FININSH_WS_ReadAsync;
-
-					case WS_ID.EN_Invalid: goto FININSH_WS_ReadAsync;
-
-					default:
-						throw new Exception("!!! 不明な WS_ID を検出しました。");
-					}
-
-					if (b_complete == true) { break; }  // for (;;) (A)
-				}
-			} // for (;;)
-
-FININSH_WS_ReadAsync:;
-			if (m_cts_for_HeartBeat_intvl_wait.IsCancellationRequested == false) { m_cts_for_HeartBeat_intvl_wait.Cancel(); }
-			await task_heart_beat;
+TERMINATE_WS_ReadAsync:;
 		}
 		catch (OperationCanceledException) {}  // m_ns_ws.ReadAsync() をキャンセルした場合（特に何もすることがない）
 		catch (System.IO.IOException ex)
@@ -175,55 +159,216 @@ FINISH_IOException:;
 			// TODO: 送信途中のリソースがあれば、ここで解放すること
 			// Server.Is_under_send_operation() で送信途中かどうか判定できる
 			// ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+			// mem_blk_WS_Send_Buf を Dispose する前に、mem_blk_WS_Send_Buf を利用する WS_Cmd_Thread が停止する必要がある。
+			mb_abort_ws_context = true;
+			if (task_cmd_thread != null)
+			{
+				if (task_cmd_thread.IsCompleted != false)
+				{
+					m_semph_WS_Cmd.Release();
+					await task_cmd_thread;
+				}
+			}
+
+			if (bDo_Add_WsContext == true)
+			{
+				if (CmdStream.Remove_WsContext(this) == false)
+				{
+					// エラー顕在化
+					ms_iLog.Wrt_Warning_Line($"!!! ws : {m_idx_ws_context} -> CmdStream.Remove_WsContext() に失敗しました。");
+				}
+			}
 		} // using, try
 
-		ms_iLog.WrtLine($"--- ws : {m_idx_ws_context} -> context を終了しました。");
+//		ms_iLog.WrtLine($"--- ws : {m_idx_ws_context} === context を終了しました。---");
 	}
 
 	// ------------------------------------------------------------------------------------
-	const int NUM_minu_HeartBeat_intvl = 3;  // 現在は３分としている
-	const int NUM_msec_HeartBeat_intvl = NUM_minu_HeartBeat_intvl * 60 * 1000;
-//	const int NUM_msec_HeartBeat_intvl = 10_000;
-
-	// ハートビートの返信を １０秒間待つ
-	// WS_Spawn_Context スレッドとの排他制御をするため、あまり長時間の待機はしない
-	const int NUM_msec_wait_for_receive_HeartBeat = 10_000;
-
-	async Task WS_HeartBeat()
+	void WS_Cmd_Thread()
 	{
+		CS_Header cs_header = new ();
+
+		// 以下の変数は、Req_Doc を利用する暫定的な方法に対応するため（完成版では不要となる）
+		Span<byte> span_ping_send_buf = stackalloc byte[4];
+		span_ping_send_buf[0] = 0x89;  // WS Ping
+		span_ping_send_buf[1] = 0x02;  // Payload len = 2
+
 		try
 		{
+			// --------------------------------------------------------
+			// display 表示が可能になるまでの処理が実行される
+
+			// m_pos_unget と m_cs_idx_unget には、「CMD_Req_Doc」or「CMD_No_Doc」が書き込まれた位置の情報が設定されている。
+			CmdStream.GetNextCmd(ref m_cs_pos_unget, ref m_cs_idx_unget, ref cs_header);
+
+			if (cs_header.m_cmdID == CS_ID.CS_No_Doc)
+			{
+				// CS_ID.CMD_No_Doc の通知は行わないことにした
+//				m_ws_Sender.Alloc_Buf(cs_header.m_cs_idx, CS_ID.CMD_No_Doc, 0);
+//				await m_ws_Sender.Send_by_WS();
+			}
+			else if (cs_header.m_cmdID == CS_ID.CS_Qry_Req_Doc)
+			{
+				// 現在の暫定的な挙動では、以下のようなことをしても意味が薄いと思うため、単純な挙動をさせることにした
+
+				// m_pos_unget, m_cs_idx_unget の情報を、「CMD_Req_Doc 直後」の状態に保存しておく。
+				// わずかなタイミングのずれで、「CMD_UpAllText」の直前の変更事項を逃す可能性があるため。
+//				uint tmp_pos_unget = m_pos_unget;
+//				ushort tmp_cs_idx_unget = m_cs_idx_unget;
+
+				for (;;)
+				{
+					m_semph_WS_Cmd.Wait();
+					if (mb_abort_ws_context == true) { goto TERMINATE_WS_Cmd_Thread; }
+
+					CmdStream.GetNextCmd(ref m_cs_pos_unget, ref m_cs_idx_unget, ref cs_header);
+
+					if (cs_header.m_cmdID == CS_ID.CMD_UpAllText) { break; }
+					if (cs_header.m_cmdID == CS_ID.CS_ERROR)
+					{
+						ms_iLog.Wrt_Warning_Line("!!! WsContext.WS_Cmd_Thread() : CMD_UpAllText 待機中に CMD_ERROR を検出しました。");
+						goto TERMINATE_WS_Cmd_Thread;
+					}
+				}
+
+				// cs_header.m_cmdID == CS_ID.CMD_UpAllText のとき、ここにくる
+				// CMD_UpAllText で Up されたものを、そのまま丸ごと Down することにした（cs_idx も含めて）
+				int allocd_pos_in_send_buf = m_ws_Sender.Alloc_Raw_Buf((int)cs_header.m_bytes_payload);
+
+				// CMD_UpAllText の内容を全て WS 送信バッファにコピーする
+				CmdStream.NoLc_Copy_CS_buf_to(m_ws_Sender.ma_sendr_buf, allocd_pos_in_send_buf
+															, cs_header.m_cs_pos_payload, cs_header.m_bytes_payload);
+				m_ws_Sender.Send_by_WS();
+			}
+			else
+			{
+				// エラー顕在化
+				ms_iLog.Wrt_Warning_Line("!!! WsContext.WS_Cmd_Thread() : 最初の１コマンドが「CMD_No_Doc」or「CMD_Req_Doc」ではありませんでした。");
+				goto TERMINATE_WS_Cmd_Thread;
+			}
+
+			// --------------------------------------------------------
+			// CMD_No_Doc or CMD_UpAllText の処理は終えたため、CMD_none となるまで情報をクライアントに送って、入力可能な状態にもっていく
+			{
+				bool b_need_to_send = false;
+				for (;;)
+				{
+					CmdStream.GetNextCmd(ref m_cs_pos_unget, ref m_cs_idx_unget, ref cs_header);
+				
+					if (cs_header.m_cmdID == CS_ID.CS_none) { break; }
+
+					if (cs_header.m_cmdID == CS_ID.CMD_INSERT)
+					{
+						m_ws_Sender.Copy_frm_CS_Payload(cs_header.m_cs_pos_payload, cs_header.m_bytes_payload);
+						b_need_to_send = true;
+						break;
+					}
+
+					if (cs_header.m_cmdID == CS_ID.CMD_REMOVE)
+					{
+						m_ws_Sender.Copy_frm_CS_Payload(cs_header.m_cs_pos_payload, cs_header.m_bytes_payload);
+						b_need_to_send = true;
+						break;
+					}
+					
+					// ###################################
+					// ここに追加で対応しなくてはならない CMD の処理をすること
+
+
+
+
+				
+
+
+					if (cs_header.m_cmdID == CS_ID.CS_ERROR)
+					{
+						ms_iLog.Wrt_Warning_Line("!!! WsContext.WS_Cmd_Thread() : CMD_display_OK 待機中に CMD_ERROR を検出しました。");
+						goto TERMINATE_WS_Cmd_Thread;
+					}
+				}
+				if (b_need_to_send == true) { m_ws_Sender.Send_by_WS(); }
+			}
+
+			// CMD_Display_OK を送信して、クライアントが入力可能な状態にする
+			m_ws_Sender.Alloc_Buf_withID(CS_ID.CMD_Display_OK, 2, (byte)CmdStream.Get_WsContexts_Count());
+			m_ws_Sender.Send_by_WS();
+			mb_is_code_displayed_on_client = true;
+
+			// --------------------------------------------------------
+			// クライアントが最初の画面表示を実行できたため、以降は通常処理に移行する（m_semph_WS_Cmd 駆動によって処理が進む）
+			// 以下の for (;;) ループから抜け出すのは
+			// (1) m_semph_WS_Cmd 駆動 -> m_ws_Sender.Send_by_WS() 等により m_ns_ws.Write() が実行され、そこで例外が発生する
+			// (2) mb_abort_ws_context == true による break
+
 			for (;;)
 			{
-				// ハートビート interval wait
-				await Task.Delay(NUM_msec_HeartBeat_intvl, m_cts_for_HeartBeat_intvl_wait.Token);
+				m_semph_WS_Cmd.Wait();
+				if (mb_abort_ws_context == true) { break; }
 
-				m_sem_for_ns_ws_write.Wait();
+				bool b_need_to_send = false;
+				for (;;)
+				{
+					CmdStream.GetNextCmd(ref m_cs_pos_unget, ref m_cs_idx_unget, ref cs_header);
 
-				ms_iLog.WrtLine($"--- ws : {m_idx_ws_context} -> Send HeartBeat");
-				await m_ns_ws.WriteAsync(ms_heart_beat_send_buf, 0, 2);
-				// 以下のように、ReadAsync もここでやりたいけど、WS_Spawn_Context スレッドの方で、
-				// ReadAsync の待機をしてるため、ReadAsync はここでできない。
-//				await m_ns_ws.ReadAsync(ma_heart_beat_recv_buf, 0, EN_bytes_heart_beat_recv_buf, cts.Token);
+					switch (cs_header.m_cmdID)
+					{
+					case CS_ID.CS_none:
+						goto BREAK_CmdStream処理;
 
-				// ハートビート 受信 wait
-				await Task.Delay(NUM_msec_wait_for_receive_HeartBeat);
-				if (mb_receive_heart_beat_on_ws_spawn_context_thread == false) { break; } // for (;;)
+					case CS_ID.CMD_Chg_NumUsrs:
+						m_ws_Sender.Alloc_Buf_withID(CS_ID.CMD_Chg_NumUsrs, 2, (byte)CmdStream.Get_WsContexts_Count());
+						b_need_to_send = true;
+						break;
 
-				// true となっているフラグのクリア
-				mb_receive_heart_beat_on_ws_spawn_context_thread = false;
+					case CS_ID.CS_Qry_Req_Doc:  // Ping を CS_Qry_Req_Doc の代わりに流用する
+						lock (m_ns_ws)
+						{
+							span_ping_send_buf[2] = (byte)(cs_header.m_cs_idx & 0xff);
+							span_ping_send_buf[3] = (byte)(cs_header.m_cs_idx >> 8);
+
+							m_ns_ws.Write(span_ping_send_buf);  // Ping の発行
+						}
+						break;
+
+					case CS_ID.CMD_INSERT:
+						// 自分が発行した INSERT であれば、処理する必要はない
+						if (cs_header.m_idx_ws_context_issuer == m_idx_ws_context) { break; }
+
+						m_ws_Sender.Copy_frm_CS_Payload(cs_header.m_cs_pos_payload, cs_header.m_bytes_payload);
+						b_need_to_send = true;
+						break;
+
+					case CS_ID.CMD_REMOVE:
+						// 自分が発行した REMOVE であれば、処理する必要はない
+						if (cs_header.m_idx_ws_context_issuer == m_idx_ws_context) { break; }
+
+						m_ws_Sender.Copy_frm_CS_Payload(cs_header.m_cs_pos_payload, cs_header.m_bytes_payload);
+						b_need_to_send = true;
+						break;
+
+					// ###################################
+					// ここに追加で対応しなくてはならない CMD の処理をすること
+
+
+
+
+
+					}
+				}
+BREAK_CmdStream処理:
+				if (b_need_to_send == true) { m_ws_Sender.Send_by_WS(); }
 			}
+
+TERMINATE_WS_Cmd_Thread:;
 		}
 		// ここでは、特に何もすることがない。例外を外に出さないようにするのみ
-		catch (Exception) {}
-		finally
+		catch (Exception ex)
 		{
-			if (m_sem_for_ns_ws_write.CurrentCount == 0) { m_sem_for_ns_ws_write.Release(); }
+			ms_iLog.Wrt_Warning_Line($"!!! WsContext.WS_Cmd_Thread() : 例外検出\r\n{ex}");
 		}
 
-		// ハートビートに失敗 or m_cts_for_Waiting_HeartBeat でキャンセル or ネットワークエラーのときに、ここにくる
-		mb_failed_heart_beat = true;
-
+		mb_abort_ws_context = true;
 		if (m_cts_for_ReadAsync_ws_ns.IsCancellationRequested == false) { m_cts_for_ReadAsync_ws_ns.Cancel(); }
 	}
 
@@ -236,253 +381,3 @@ FINISH_IOException:;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////
-
-class WS_Recv_Buf
-{
-	readonly public byte[] ma_buf;
-	int m_idx_byte_buf = 0;
-	int m_bytes_recv = 0;
-
-	public WS_Recv_Buf(in byte[] ws_buf)
-	{
-		ma_buf = ws_buf;
-	}
-
-	// ------------------------------------------------------------------------------------
-	public void Prepare_Read(int bytes_recv)
-	{
-		m_idx_byte_buf = 0;
-		m_bytes_recv = bytes_recv;
-	}
-
-	// ------------------------------------------------------------------------------------
-	public enum WS_ID
-	{
-		EN_Pong,
-		EN_Close,
-		EN_none,  // 通常処理を終えて、特に通知することがない場合
-		EN_Invalid,  // 不正な ws パケットを送ってきたため、相手を切断する
-	}
-
-	// ------------------------------------------------------------------------------------
-	// bool -> Read が「完了した場合 true」
-
-	public unsafe (WS_ID, bool) Read()
-	{
-#if false
-		fixed (byte* DBG_pTop_buf = ma_buf)
-		{
-			string str = Tools.ByteBuf_toString(DBG_pTop_buf, m_bytes_recv);
-			Console.WriteLine("raw (masked)-> " + str);
-		}
-#endif
-		int len = ma_buf[m_idx_byte_buf + 1] & 0x7f;  // MASK ビットは消しておく
-
-		switch (ma_buf[m_idx_byte_buf])
-		{
-		// Pong の処理
-		case 0x8a:
-			if (len >= 126)
-			{
-				Console.WriteLine($"!!! 不正な WS パケットを受信しました。pong で len -> {len}");
-				return (WS_ID.EN_Invalid, true);
-			}
-
-			m_idx_byte_buf += 2 + len;
-			if (m_idx_byte_buf == m_bytes_recv)
-			{ return (WS_ID.EN_Pong, true); }
-			else
-			{ return (WS_ID.EN_Pong, false); }
-			
-		// Close の処理
-		case 0x88:
-			return (WS_ID.EN_Close, true);
-
-		// バイナリフレームの処理
-		case 0x82:
-//		case 0x81:  // 実運用時には、テキストフレームはエラーとするように変更する
-			break;
-
-		default:
-			Console.WriteLine($"!!! 不正な WS パケットを受信しました。opcode -> {ma_buf[m_idx_byte_buf]:x2}");
-			return (WS_ID.EN_Invalid, true);
-		}
-
-		// ------------------------------------------------------
-		fixed (byte* pTop_buf = ma_buf)
-		{
-			// まず、length の処理をする
-			//【注意】EN_bytes_WS_Buf を超えるデータを送ってくることはないようにしているはず
-			byte* pbuf = pTop_buf + m_idx_byte_buf + 2;  // opcode と len の２バイトは、読み込み済み
-
-			// ------------------------------------------------------
-			// ペイロード長の取得
-			if (len >= 126)
-			{
-				if (len == 126)
-				{
-					// ビッグエンディアン
-					len = *pbuf * 256 + *(pbuf + 1);
-					pbuf += 2;
-
-					// -8 は、ヘッダの 4 bytes と マスクキー の 4 bytes を引く必要があるため。
-					if (len > Common.EN_bytes_WS_Buf - 8)
-					{
-						Console.WriteLine($"!!! 不正な長さの WS パケットを受信しました。ペイロード長 -> {len} bytes");
-						return (WS_ID.EN_Invalid, true);
-					}
-				}
-				else
-				// len == 127 のときの処理
-				{
-					Console.WriteLine($"!!! 不正な長さの WS パケットを受信しました。ペイロード長が 16bits を超えています。");
-					return (WS_ID.EN_Invalid, true);
-				}
-			}
-
-			// ------------------------------------------------------
-			// マスクを外す処理
-			byte* pTmnt_payload = pbuf + 4 + len;  // +4 は、マスクキーの分
-
-			Unmask_Payload(pbuf, len);
-			pbuf += 4;  // マスクキーの分を読み飛ばす
-
-			// ++++++++++++++++++++++++++++++
-			{
-				string str = Tools.ByteBuf_toString(pbuf, len);
-				Console.WriteLine("unmasked -> " + str);
-
-//				str = Encoding.UTF8.GetString(pbuf, len);
-//				Console.WriteLine("unmasked -> " + str);
-			}
-
-			Payload.Read(pbuf, len);
-		}
-
-		return (WS_ID.EN_none, true);
-	}
-
-	// ------------------------------------------------------------------------------------
-	// pbuf には、ws パケットのマスクキーのアドレスを渡す
-
-	static unsafe void Unmask_Payload(byte* pbuf, in int len)
-	{
-		uint mask_key = *(uint*)pbuf;
-		pbuf += 4;
-
-		for (int i = len >> 2; i-- > 0; )
-		{
-			*(uint*)pbuf = *(uint*)pbuf ^ mask_key;
-			pbuf += 4;
-		}
-
-		switch (len & 3)
-		{
-		case 0: return;
-		case 1:
-			mask_key &= 0x0000_00ff;
-			break;
-		case 2:
-			mask_key &= 0x0000_ffff;
-			break;
-		case 3:
-			mask_key &= 0x00ff_ffff;
-			break;
-		}
-
-		*(uint*)pbuf = *(uint*)pbuf ^ mask_key;
-	}
-
-	// ------------------------------------------------------------------------------------
-	// m_idx_byte_buf の場所から、行末までの文字列を取得する
-
-	public unsafe string DBG_Get_1Line()
-	{
-		if (m_idx_byte_buf == m_bytes_recv) { return ""; }
-
-		fixed (byte* pTop_byte_buf = ma_buf)
-		{
-			byte* pTmnt_byte_buf = pTop_byte_buf + m_bytes_recv;
-
-			byte* pStart_search =  pTop_byte_buf + m_idx_byte_buf;
-			byte* pbyte = pStart_search;
-			{
-				byte chr = *pbyte;
-				if (chr == 0x0d || chr == 0x0a) { return ""; }
-			}
-			// 上の操作により、有効文字が１文字以上あることが確定される。
-			
-			for (;;)
-			{
-				if (++pbyte == pTmnt_byte_buf) { break; }
-
-				byte chr = *pbyte;
-				if (chr == 0x0d || chr == 0x0a) { break; }
-			}
-
-			return Encoding.UTF8.GetString(pStart_search, (int)(pbyte - pStart_search));
-		}
-	}
-}
-
-/////////////////////////////////////////////////////////////////////////////////////////
-
-class WS_Send_Buf
-{
-	readonly public byte[] ma_buf;
-	int m_idx_byte_buf = 0;
-
-	public WS_Send_Buf(in byte[] ws_buf)
-	{
-		ma_buf = ws_buf;
-	}
-
-	// ------------------------------------------------------------------------------------
-	// 戻り値は、送信すべきバイト数
-
-	static readonly byte[] ms_utf8_accept_http_header = Encoding.UTF8.GetBytes(
-		"HTTP/1.1 101 Switching Protocols\r\n"
-		+ "Upgrade: websocket\r\n"
-		+ "Connection: Upgrade\r\n"
-		+ "Sec-WebSocket-Accept: ");
-
-	public unsafe int Set_WS_Accept_Response(in string str_accept_key)
-	{
-		fixed (byte* pTop_dst = ma_buf)
-		fixed (byte* pTop_utf8_http_header = ms_utf8_accept_http_header)
-		fixed (char* pTop_accept_key = str_accept_key)
-		{
-			byte* pdst = pTop_dst;
-			{
-				byte* pTmnt_utf8_http_header = pTop_utf8_http_header + ms_utf8_accept_http_header.Length;
-				byte* psrc_utf8 = pTop_utf8_http_header;
-				for (int i = ms_utf8_accept_http_header.Length >> 3; i-- > 0; )
-				{
-					*(ulong*)pdst = *(ulong*)psrc_utf8;
-					pdst += 8;
-					psrc_utf8 += 8;
-				}
-
-				for (; psrc_utf8 < pTmnt_utf8_http_header;)
-				{
-					*pdst++ = *psrc_utf8++;
-				}
-			}
-
-			// accept-key の付加
-			{
-				char* psrc_accept_str = pTop_accept_key;
-				for (int i = 28; i-- > 0; )
-				{ *pdst++ = (byte)*psrc_accept_str++; }
-			}
-			*(uint*)pdst = 0x0a0d0a0d;
-
-			m_idx_byte_buf = (int)(pdst - pTop_dst) + 4;
-
-//			Console.WriteLine("+++ Accept HttpHeader");
-//			Console.WriteLine(Encoding.UTF8.GetString(pTop_dst, m_idx_byte_buf));
-		}
-		
-		return m_idx_byte_buf;
-	}
-}
