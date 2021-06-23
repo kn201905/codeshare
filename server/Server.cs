@@ -19,8 +19,7 @@ static class Server
 	static MemBlk_Pool ms_mem_blk_pool_Html = null;
 
 	// EN_bytes_WS_Buf は、setting.cs で定義している
-	// mem_blk は、read と write で兼用する（ハートビートの送信用は別枠）
-	static MemBlk_Pool ms_mem_blk_pool_WS = null;
+	static MemBlk_Pool ms_mem_blk_pool_WS_Buf = null;
 
 	// =====================================================
 	struct HtmlContextInfo
@@ -35,12 +34,9 @@ static class Server
 		}
 	}
 
-	static SortedList<uint, HtmlContextInfo> ms_List_HtmlContextInfo = new ();
+	static SortedList<ushort, HtmlContextInfo> ms_List_HtmlContextInfo = new ();
 	static SemaphoreSlim ms_semph_List_HtmlContextInfo = null;
 	// =====================================================
-
-	static List<WsContext> ms_List_WsContext = new ();
-	static SemaphoreSlim ms_semph_List_WsContext = null;
 
 	// ------------------------------------------------------------------------------------
 	public static async Task Start()
@@ -49,19 +45,20 @@ static class Server
 		HtmlContext.Set_mem_blk_pool(ms_mem_blk_pool_Html);
 
 		// WS ペイロードのマスクを外す処理を簡易化するために、「+3」としている。
-		ms_mem_blk_pool_WS = new MemBlk_Pool(Common.EN_bytes_WS_Buf + 3, "WS_Recv_Buf");
-		WsContext.Set_mem_blk_pool(ms_mem_blk_pool_WS);
+		ms_mem_blk_pool_WS_Buf = new MemBlk_Pool(Common.EN_bytes_WS_Buf + 3, "WS_Buf");
+		WsContext.Set_mem_blk_pool_for_WS_Buf(ms_mem_blk_pool_WS_Buf);
 
 		// Server.Close() により停止させるとき、ソケットをクローズさせるためにメンバ変数として記録している
-		ms_TcpListener_html = new TcpListener(IPAddress.Parse(Setting.EN_LocalAddr_for_server), Setting.NUM_html_port);
-		uint idx_html_context = 0;
+		ms_TcpListener_html = new TcpListener(Setting.ms_Address_for_TcpListener, Setting.NUM_html_port);
+
+		// idx_html_context は、65535 の次は 0 となる（重複防止の機構を付けるべきか？？）
+		ushort idx_html_context = 0;
 
 		using (ms_semph_List_HtmlContextInfo = new SemaphoreSlim(1))
-		using (ms_semph_List_WsContext = new SemaphoreSlim(1))
 		try
 		{
 			ms_TcpListener_html.Start();
-			ms_iLog.WrtLine("--- codeshare サーバーが起動しました。");
+			ms_iLog.WrtLine("--- codeshare サーバーが起動しました。---\r\n");
 
 			for (;;)
 			{
@@ -85,6 +82,7 @@ static class Server
 				}
 				
 				// ThreadProc_ServerClose_by_WS_Context() を実行している場合の処理
+				// 余程のタイミングでない限り、ここには来ないはず
 				ms_iLog.WrtLine("--- HtmlContext を停止させます。idx_html_context -> " + idx_html_context);
 				html_context.Abort_WS_Context_if_exists();
 
@@ -101,23 +99,26 @@ static class Server
 				// ms_TcpListener_html.Server.Close(); による例外送出
 				goto FINISH_SocketException;
 			}
-			else
+
+			if (ex.ErrorCode == 125)
 			{
-				ms_iLog.Wrt_Warning_Line(
-					$"!!! ms_TcpListener_html.AcceptTcpClientAsync() ループ処理中に例外を検出しました。\r\n{ex}");
+				// 125 : Operation canceled
+				// ThreadProc_ServerClose_by_WS_Context() によって、引き起こされた例外と考えられる。
+				goto FINISH_SocketException;
 			}
+			
+			ms_iLog.Wrt_Warning_Line($"!!! Server.Start() ： 例外（SocketException）を検出しました。\r\n{ex}");
 
 FINISH_SocketException:;
 		}
 		catch (Exception ex)
 		{
-			ms_iLog.Wrt_Warning_Line(
-				$"!!! ms_TcpListener_html.AcceptTcpClientAsync() ループ処理中に例外を検出しました。\r\n{ex}");
+			ms_iLog.Wrt_Warning_Line($"!!! Server.Start() ： 例外を検出しました。\r\n{ex}");
 		}
 	}
 
 	// ------------------------------------------------------------------------------------
-	public static void Remove_HtmlContextInfo(in uint idx_html_context)
+	public static void Remove_HtmlContextInfo(in ushort idx_html_context)
 	{
 		// ms_semph_List_HtmlContextInfo によるデッドロックの回避措置
 		lock (msb_Is_in_ShuttingDown)
@@ -159,6 +160,7 @@ FINISH_SocketException:;
 				await context_info.m_task_html_context;
 				ms_iLog.WrtLine("--- HtmlContext が停止しました。idx_html_context -> " + kvp.Key);
 			}
+			ms_List_HtmlContextInfo.Clear();
 
 			ms_semph_List_HtmlContextInfo.Release();
 		}
@@ -169,15 +171,9 @@ FINISH_SocketException:;
 		finally
 		{
 			if (ms_semph_List_HtmlContextInfo.CurrentCount == 0) { ms_semph_List_HtmlContextInfo.Release(); }
-			ms_List_HtmlContextInfo.Clear();
 
 			ms_TcpListener_html.Server.Close();
 		}
-	}
-
-	// ------------------------------------------------------------------------------------
-	public static void Add_WsContext(WsContext ws_context_to_add)
-	{
 	}
 
 	// ==================================================
@@ -203,6 +199,7 @@ class StaticFiles
 {
 	public static byte[] msa_index_html;
 	public static byte[] msa_client_js;
+	public static byte[] msa_WS_Stream_js;
 	public static byte[] msa_styles_css;
 
 	public static byte[] msa_404_not_found;
@@ -211,37 +208,38 @@ class StaticFiles
 	[System.Runtime.CompilerServices.ModuleInitializer]
 	public static void Module_Init()
 	{
-		string str_index_html_header = "HTTP/1.1 200 OK\r\n"
+		string str_html_header = "HTTP/1.1 200 OK\r\n"
 			+ "Cache-Control: public, max-age=604800, immutable\r\n"
 			+ "Content-Type: text/html; charset=UTF-8\r\n"
 			+ "Connection: keep-alive\r\n"
 			+ $"Keep-Alive: timeout={Setting.NUM_seconds_html_keep_alive}\r\n"
 			+ "Content-Length: ";
 
-		string str_client_js_header = "HTTP/1.1 200 OK\r\n"
+		string str_js_header = "HTTP/1.1 200 OK\r\n"
 			+ "Cache-Control: public, max-age=604800, immutable\r\n"
 			+ "Content-Type: application/javascript; charset=UTF-8\r\n"
 			+ "Connection: keep-alive\r\n"
 			+ $"Keep-Alive: timeout={Setting.NUM_seconds_html_keep_alive}\r\n"
 			+ "Content-Length: ";
 
-		string str_styles_css_header = "HTTP/1.1 200 OK\r\n"
+		string str_css_header = "HTTP/1.1 200 OK\r\n"
 			+ "Cache-Control: public, max-age=604800, immutable\r\n"
 			+ "Content-Type: text/css; charset=UTF-8\r\n"
 			+ "Connection: keep-alive\r\n"
 			+ $"Keep-Alive: timeout={Setting.NUM_seconds_html_keep_alive}\r\n"
 			+ "Content-Length: ";
 			
-		msa_index_html = Crt_ResBytes(str_index_html_header, Setting.EN_public_folder + "\\index.html");
-		msa_client_js = Crt_ResBytes(str_client_js_header, Setting.EN_public_folder + "\\client.js");
-		msa_styles_css = Crt_ResBytes(str_styles_css_header, Setting.EN_public_folder + "\\styles.css");
+		msa_index_html = Crt_ResBytes(str_html_header, Setting.EN_public_folder + "/index.html");
+		msa_WS_Stream_js = Crt_ResBytes(str_js_header, Setting.EN_public_folder + "/WS_Stream.js");
+		msa_client_js = Crt_ResBytes(str_js_header, Setting.EN_public_folder + "/client.js");
+		msa_styles_css = Crt_ResBytes(str_css_header, Setting.EN_public_folder + "/styles.css");
 
 		// ------------------------------------
 		string str_404_header = "HTTP/1.1 404 Not Found\r\n"
 			+ "Content-Type: text/html; charset=UTF-8\r\n"
 			+ "Content-Length: ";
 
-		msa_404_not_found = Crt_ResBytes(str_404_header, Setting.EN_public_folder + "\\404.html");
+		msa_404_not_found = Crt_ResBytes(str_404_header, Setting.EN_public_folder + "/404.html");
 	}
 
 	// ------------------------------------------------------------------------------------
