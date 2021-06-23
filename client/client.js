@@ -1,25 +1,38 @@
 'use strict';
 
+const g_bデバッグ環境 = true;
+const EN_str_ws_host_port = (g_bデバッグ環境 == true) ? "ws://127.0.0.1:80" : "ws://codeshare.pgw.jp:22225";
+console.log('--- client.js スタート\r\nEN_str_ws_host_port -> ' + EN_str_ws_host_port);
+
+let g_b_change_by_UpAllText = false;
+let g_change_start_R_by_CMD = -1;
+
 // 共通定数 ======================
 const EN_bytes_WS_Buf = 16 * 1024;
 
-// コマンドの上位４bit は、パラメータ長のフラグとする
-// パラメータ長が 16bit となるとき、「１」となる。16 bit値は、LE で格納される。
-const CMD_CONNECTCMD_LOAD = 0;
-// 挿入位置 (R, C)、行数
-// 以降は、１行の文字数（0 以上）の配列が続いて、その後、UTF16 での文字列が続く
-// UTF16 の文字を代入するときは、偶数インデックスが要求されるため、文字列情報の前に padding が入ることがある
+// (byte) cmdID -> dc_idx -> (ushort) R -> C -> 行数
+// 以降は、１行の文字数（0以上 255以下）の配列が続いて、その後、UTF16 での文字列が続く
+// UTF16 の文字を代入する際は、偶数インデックスが要求されるため、文字列情報の前に padding が入ることがある
 // なお、１行の文字数が 256 文字を超える場合は、不正な文字列として、そのユーザを切断する
 // 一度に送出するのは「EN_bytes_WS_Buf」バイト以下にすること
 const CMD_INSERT = 1;
-const CMD_REMOVE = 2;  // 削除開始位置 (R, C)、終了位置 (R, C)
+const CMD_REMOVE = 2;
 
+const CMD_Display_OK = 10;
+const CMD_Chg_NumUsrs = 11;
 const CMD_CLOSE_SERVER = 15;
 
+// -------------------------------
+// 128 ～ 255 は、暫定的なコマンド
+const CMD_Req_Doc = 131;
+// UP の場合 -> (byte) cmdID, 0 -> (ushort) cs_idx, 文字数, 文字列
+// DOWN の場合 -> (byte) cmdID, 0 -> (ushort) 文字数, 文字列
+const CMD_UpAllText = 135;
 // ===============================
 
 const g_ary_send_buf = new ArrayBuffer(EN_bytes_WS_Buf);
-const g_byte_view_send_buf = new Uint8Array(g_ary_send_buf);
+const g_u8_send_buf = new Uint8Array(g_ary_send_buf);
+const g_u16_send_buf = new Uint16Array(g_ary_send_buf);
 
 // ---------------------------------------------------------
 const g_e_body = document.body;
@@ -53,19 +66,32 @@ Element.prototype.Add_FlexStg = function() {
 	return e_div;
 };
 
+const g_e_div_editor = g_e_body.Add_DivTxt();
+g_e_div_editor.id = 'editor';
+g_e_div_editor.style.display = 'none';
+
 const g_Ctrl_Pnl = new function() {
 	const m_e_panel = g_e_body.Add_Div();
 	m_e_panel.classList.add('Ctrl_pnl');
 	
 	const e_stg = m_e_panel.Add_FlexStg();
 	
-	const m_e_divTxt_Info = e_stg.Add_DivTxt('接続人数: １人');
-	m_e_divTxt_Info.classList.add('Info_divTxt');
+	const m_e_divTxt_NumUsrs = e_stg.Add_DivTxt('接続人数: ０人');
+	m_e_divTxt_NumUsrs.classList.add('Info_divTxt');
 	
+	const m_e_btn_Test = e_stg.Add_Btn('テスト');
+	m_e_btn_Test.onclick = () => {
+		console.log(JSON.stringify(ace_document.getValue()));
+	};
+
 	const m_e_btn_ServerClose = e_stg.Add_Btn('サーバー終了');
 	m_e_btn_ServerClose.onclick = () => {
-		g_byte_view_send_buf[0] = CMD_CLOSE_SERVER;
+		g_u8_send_buf[0] = CMD_CLOSE_SERVER;
 		g_ws.send(new Uint8Array(g_ary_send_buf, 0, 1));
+	};
+	
+	this.Chg_NumUsrs = (num) => {
+		m_e_divTxt_NumUsrs.textContent = `接続人数: ${num}人`;
 	};
 };
 
@@ -78,8 +104,8 @@ ace_session.setNewLineMode("windows");
 const ace_document = ace_session.getDocument();
 
 // --------------------
-const EN_str_ws_host_port = "ws://127.0.0.1:80";
 const g_ws = new WebSocket(EN_str_ws_host_port);
+g_ws.binaryType = 'arraybuffer';
 
 // --------------------
 g_ws.onopen = () => {
@@ -90,13 +116,42 @@ g_ws.onclose = () => {
 	console.log('--- WebSocket が close しました。');
 };
 
-g_ws.onmessage = (e) => {
-//	console.log( Object.prototype.toString.apply(e.data) );
+g_ws.onmessage = (e) => g_WS_Reader.Interpret_ArrayBuffer(e.data);
+
+g_ws.onerror = (e) => {
+	console.log("!!! Websocket で onerror を補足しました。");
+	console.log(e);
 };
 
+// ---------------------------------------------------------
+// document 変更をサーバーに通知する設定
 ace_session.on('change', (delta) => {
-	if (delta.action == 'insert') { Ace_insert(delta); }
-	else if (delta.action == 'remove') { Ace_remove(delta); }
+	if (g_b_change_by_UpAllText == true)
+	{
+		g_b_change_by_UpAllText = false;
+		return;
+	}
+	
+	// CMD による変更であるかどうかのチェック
+	if (delta.start.row == g_change_start_R_by_CMD)
+	{
+		g_change_start_R_by_CMD = -1;
+		return;
+	}
+
+	// 一度に送出するバイト数が EN_bytes_WS_Buf 以下であるか、また１行が 255文字以下であることをチェック
+	// ***** 現時点では、分割送信をサポートしていない
+	if (IsOK_bytes_lines(delta.lines) == false) { return; }
+
+	// 変更をサーバーに通知する
+	if (delta.action == 'insert')
+	{
+		Send_InsertDelta(delta);
+	}
+	else if (delta.action == 'remove')
+	{
+		Send_RemoveDelta(delta);
+	}
 	else {
 		alert("不明な delta を検出しました。");
 		console.log('!!! 不明な delta を検出しました。');
@@ -104,85 +159,63 @@ ace_session.on('change', (delta) => {
 	}
 });
 
-// delta の row, column は 0 スタート
-function Ace_insert(delta)
+// ---------------------------------------------------------
+function Send_InsertDelta(delta)
 {
-	console.log(delta);
-	
-	// まず送出バイト数をチェックする
-	let cmd = CMD_INSERT;
-	let idx_buf = 1;
-	
-	let bytes_wrtn = Set_header_val(idx_buf, delta.start.row, "delta.start.row")
-	if (bytes_wrtn < 0) { return; }
-	if (bytes_wrtn == 2) { cmd |= 0x80; }
-	idx_buf += bytes_wrtn;
-	
-	bytes_wrtn = Set_header_val(idx_buf, delta.start.column, "delta.start.column")
-	if (bytes_wrtn < 0) { return; }
-	if (bytes_wrtn == 2) { cmd |= 0x40; }
-	idx_buf += bytes_wrtn;
+	g_u8_send_buf[0] = CMD_INSERT;
+// g_u8_send_buf[1] = dc_idx;  // ドキュメントインデックス
 
-	// 一度に送出するバイト数が EN_bytes_WS_Buf 以下であるかをチェック
-	// ***** 現時点では、分割送信をサポートしていない
-	if (IsOK_bytes_lines(delta.lines) == false) { return; }
-
-	bytes_wrtn = Set_header_val(idx_buf, delta.lines.length, "delta.lines.length")
-	if (bytes_wrtn < 0) { return; }
-	if (bytes_wrtn == 2) { cmd |= 0x20; }
-	idx_buf += bytes_wrtn;
+	const bytes_to_send = WrtDelta_to_SendBuf(delta);
+	console.log(`◀ CMD_INSERT を送信します。-> ${bytes_to_send} bytes`);
 	
-	// コマンドの記録
-	g_byte_view_send_buf[0] = cmd;
+	// ++++++++++++++++++++++++++++++++
+//	console.log(`--- 送信バイト数 -> ${bytes_to_send}`);
+	// Firefox では、送信サイズが大きい場合、ここでエラーが発生する。理由は不明、、、
+	g_ws.send(new Uint8Array(g_ary_send_buf, 0, bytes_to_send));
+}
+
+// ---------------------------------------------------------
+function Send_RemoveDelta(delta)
+{
+	g_u8_send_buf[0] = CMD_REMOVE;
+// g_u8_send_buf[1] = dc_idx;  // ドキュメントインデックス
+
+	const bytes_to_send = WrtDelta_to_SendBuf(delta);
+	console.log(`◀ CMD_REMOVE を送信します。-> ${bytes_to_send} bytes`);
+
+	// ++++++++++++++++++++++++++++++++
+//	console.log(`--- 送信バイト数 -> ${bytes_to_send}`);
+	// Firefox では、送信サイズが大きい場合、ここでエラーが発生する。理由は不明、、、
+	g_ws.send(new Uint8Array(g_ary_send_buf, 0, bytes_to_send));
+}
+
+// ---------------------------------------------------------
+// delta の start、lines 情報を書き込む
+// 戻り値： 送信すべきバイト数
+function WrtDelta_to_SendBuf(delta)
+{
+	g_u16_send_buf[1] = delta.start.row;
+	g_u16_send_buf[2] = delta.start.column;
+	g_u16_send_buf[3] = delta.lines.length;
+
+	// --------------------------------
+	// 各行の文字数を書き込む
+	let u8_pos_unused = 8;
+	for (const line of delta.lines)
+	{ g_u8_send_buf[u8_pos_unused++] = line.length; }
 	
 	// --------------------------------
-	for (const line of delta.lines)
-	{ g_byte_view_send_buf[idx_buf++] = line.length; }
-	
-	if (idx_buf & 1) { idx_buf++; }  // 配列境界の調整（padding）
-	const ary_u16 = new Uint16Array(g_ary_send_buf, idx_buf);
-		
-	let idx_for_u16 = 0;
+	// 文字列を書き込む
+	let u16_pos_unused = (u8_pos_unused + 1) >> 1;  // +1 は、配列境界の調整
 	for (const line of delta.lines)
 	{
 		let idx_chr = 0;
 		for (const len_line = line.length; idx_chr < len_line; )
 		{
-			ary_u16[idx_for_u16++] = line.charCodeAt(idx_chr++);
+			g_u16_send_buf[u16_pos_unused++] = line.charCodeAt(idx_chr++);
 		}
 	}
-	
-	const bytes_send = idx_buf + idx_for_u16 * 2;
-	g_ws.send(new Uint8Array(g_ary_send_buf, 0, bytes_send));
-}
-
-// --------------------------------
-function Ace_remove(delta)
-{
-	console.log(delta);
-}
-
-// --------------------------------
-// Violation があった場合、-1 が返される。
-function Set_header_val(idx_buf, val_header, val_name)
-{
-	if (val_header < 256)
-	{
-		g_byte_view_send_buf[idx_buf] = val_header;
-		return 1;
-	}
-	else
-	{
-		if (val_header >= 65535)
-		{
-			Violate_Rule("次の操作はできません： " + val_name + " >= 65535");
-			return -1;
-		}
-		
-		g_byte_view_send_buf[idx_buf] = val_header & 0xff;
-		g_byte_view_send_buf[idx_buf + 1] = val_header >>> 8;
-		return 2;
-	}
+	return u16_pos_unused << 1;
 }
 
 // --------------------------------
@@ -207,12 +240,13 @@ function IsOK_bytes_lines(lines)
 		total_len_lines += line.length;
 	}
 	
-	// 7 : ヘッダの最長バイト数
+	// 8 : ヘッダの最長バイト数
 	// * 2 : UTF-16 であるため、１文字につき２バイト
 	// + 1 : 配列境界のための padding
-	if (7 + lines.length + 1 + total_len_lines * 2 <= EN_bytes_WS_Buf)
+	if (8 + lines.length + 1 + total_len_lines * 2 <= EN_bytes_WS_Buf)
 	{ return true; }
 	
 	Violate_Rule("未対応：一度に送信する文字数が、バッファサイズを超えました、、、");
 	return false;
 }
+
