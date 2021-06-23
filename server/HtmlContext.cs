@@ -3,6 +3,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Net.Sockets;
 using System.Text;
+using System.Net;
 
 #pragma warning disable CA1835  // CA1835: ReadAsync(), WriteAsync() を、ReadOnlyMemory<> 呼び出しに変更する
 
@@ -10,7 +11,7 @@ using System.Text;
 
 class HtmlContext
 {
-	readonly uint m_idx_html_context;
+	readonly ushort m_idx_html_context;
 	readonly TcpClient m_tcpClt_Html;
 
 	bool mb_dont_create_ws_context = false;
@@ -20,7 +21,7 @@ class HtmlContext
 	public static void Set_mem_blk_pool(MemBlk_Pool mem_blk_pool) => ms_mem_blk_pool_Html = mem_blk_pool;
 
 	// ------------------------------------------------------------------------------------
-	public HtmlContext(TcpClient tcp_client_Html, uint idx_clt_context)
+	public HtmlContext(TcpClient tcp_client_Html, ushort idx_clt_context)
 	{
 		m_tcpClt_Html = tcp_client_Html;
 		m_idx_html_context = idx_clt_context;
@@ -52,7 +53,7 @@ class HtmlContext
 
 	public async Task Spawn_HtmlContext()
 	{
-		ms_iLog.WrtLine($"--- html : {m_idx_html_context} -> 新規 Spawn_Context() ---");
+		ms_iLog.WrtLine($"    html : {m_idx_html_context} --- 新規 Spawn_Context() ---");
 
 		using (m_tcpClt_Html)
 		using (NetworkStream ns_Html = m_tcpClt_Html.GetStream())
@@ -135,8 +136,14 @@ class HtmlContext
 				{
 					if (mb_dont_create_ws_context == false)
 					{
+						ms_iLog.WrtLine($"\r\n--- html : {m_idx_html_context} === Upgrade to WebSocket ===\r\n"
+											+ $"+++ address -> {((IPEndPoint)m_tcpClt_Html.Client.RemoteEndPoint).Address}\r\n");
+
 						m_ws_context = new WsContext(m_idx_html_context);
 						task_ws_context = m_ws_context.WS_Spawn_Context(ns_Html, str_accept_key);
+
+						// WS_Spawn_Context() を発行しているため、この lock(this) を抜ける前に
+						// WsContext の m_cts_for_ReadAsync_ws_ns, m_semph_WS_Cmd は生成済みとなっている。
 					}
 				}
 				if (task_ws_context != null) { await task_ws_context; }
@@ -189,7 +196,7 @@ FINISH_IOException:;
 
 		Server.Remove_HtmlContextInfo(m_idx_html_context);
 
-		ms_iLog.WrtLine($"\r\n--- html : {m_idx_html_context} -> 接続を終了しました。---\r\n");
+		ms_iLog.WrtLine($"    html : {m_idx_html_context} xxx 接続を終了しました。xxx");
 //    Server.Remove_frm_task_list(m_idx_clt_context);
 	}
 
@@ -312,6 +319,7 @@ class Html_Recv_Buf
 
 	static readonly ulong ms_ulstr_index_html = UTF8_str.AsciiStr8_to_ulong("/index.h");
 	static readonly ulong ms_ulstr_client_js = UTF8_str.AsciiStr8_to_ulong("/client.");
+	static readonly ulong ms_ulstr_WS_Stream_js = UTF8_str.AsciiStr8_to_ulong("/WS_Stre");
 	static readonly ulong ms_ulstr_styles_css = UTF8_str.AsciiStr8_to_ulong("/styles.");
 	static readonly ulong ms_ulstr_favicon = UTF8_str.AsciiStr8_to_ulong("/favicon");
 
@@ -325,6 +333,7 @@ class Html_Recv_Buf
 			ulong ulstr = *(ulong*)pbyte_buf;
 			if (ulstr == ms_ulstr_index_html) { return StaticFiles.msa_index_html; }
 			else if (ulstr == ms_ulstr_client_js) { return StaticFiles.msa_client_js; }
+			else if (ulstr == ms_ulstr_WS_Stream_js) { return StaticFiles.msa_WS_Stream_js; }
 			else if (ulstr == ms_ulstr_styles_css) { return StaticFiles.msa_styles_css; }
 			else if (ulstr == ms_ulstr_favicon) { return StaticFiles.msa_404_not_found; }
 
