@@ -9,8 +9,7 @@ namespace codeshare
 	{
 		static async Task Main()
 		{
-			Task task_2 = Server.Start();
-			await task_2;
+			await Server.Start();
 		}
 	}
 	
@@ -27,8 +26,7 @@ namespace codeshare
 
 			for (;;)
 			{
-				var task_1 = ms_TcpListener_http.AcceptTcpClientAsync();
-				TcpClient tcp_client = await task_1;
+				TcpClient tcp_client = await ms_TcpListener_http.AcceptTcpClientAsync();
 
 				Console.WriteLine("--- 接続を検知しました ---");
 			}
